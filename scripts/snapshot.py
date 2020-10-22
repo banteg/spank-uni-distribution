@@ -16,6 +16,7 @@ spankbank_deploy = 6276045  # https://etherscan.io/tx/0xc6123eea98af9db149313005
 uniswap_v1_deploy = 6627917  # https://etherscan.io/tx/0xc1b2646d0ad4a3a151ebdaaa7ef72e3ab1aa13aa49d0b7a3ca020f5ee7b1b010
 uni_deploy = 10861674  # https://etherscan.io/tx/0x4b37d2f343608457ca3322accdab2811c707acf3eb07a40dd8d9567093ea5b82
 spankbank = interface.SpankBank("0x1ECB60873E495dDFa2a13A8F4140e490dd574E6F")
+multicall = interface.Multicall("0xeefBa1e63905eF1D7ACbA5a8513c70307C1cE441")
 
 
 def main():
@@ -67,7 +68,8 @@ def cached(path):
 def fetch_logs():
     logs = []
     step = 100000
-    for start in trange(uniswap_v1_deploy, uni_deploy, step):
+    # NOTE: start from spankbank deploy since we need to catch all stakers
+    for start in trange(spankbank_deploy, uni_deploy, step):
         end = min(start + step - 1, uni_deploy)
         logs.extend(
             web3.eth.getLogs(
@@ -98,6 +100,8 @@ def calc_points(events):
     periods = defaultdict(dict)
     events = groupby("event", events)
     for event in events["CheckInEvent"]:
+        if event.blockNumber < uniswap_v1_deploy or event.blockNumber > uni_deploy:
+            continue
         periods[event.args.period][event.args.staker] = event.args.spankPoints
     return dict(periods)
 
@@ -106,12 +110,21 @@ def calc_points(events):
 def calc_spank(events):
     periods = {}
     events = groupby("event", events)
-    stakers = {event.args.staker for event in events["StakeEvent"]} | {
-        event.args.newAddress for event in events["SplitStakeEvent"]
-    }
+    new_stakers = {event.args.staker for event in events["StakeEvent"]}
+    split_stakers = {event.args.newAddress for event in events["SplitStakeEvent"]}
+    stakers = sorted(new_stakers | split_stakers)
     print(len(stakers), "stakers")
     end_time = chain[uni_deploy].timestamp
-    for period in range(spankbank.currentPeriod() + 1):
+    calls = [
+        [str(spankbank), spankbank.stakers.encode_input(staker)] for staker in stakers
+    ]
+    _, results = multicall.aggregate.call(calls)
+    staker_info = {
+        staker: spankbank.stakers.decode_output(resp)
+        for staker, resp in zip(stakers, results)
+    }
+
+    for period in range(1, spankbank.currentPeriod() + 1):
         data = spankbank.periods(period)
         period_end = data[5]
         if period_end > end_time:
@@ -123,12 +136,23 @@ def calc_spank(events):
             "stakers": {},
         }
         print(f"period {period} snapshot block {end_block}")
-        for staker in tqdm(stakers):
-            # NOTE: the next line requires an archive node
-            spank_staked, *_ = spankbank.stakers(staker, block_identifier=end_block)
-            if spank_staked == 0:
-                continue
-            periods[period]["stakers"][staker] = spank_staked
+        try:
+            _, results = multicall.aggregate.call(calls, block_identifier=end_block)
+            for staker, resp in zip(stakers, results):
+                spank_staked, *_ = spankbank.stakers.decode_output(resp)
+                if spank_staked > 0:
+                    periods[period]["stakers"][staker] = spank_staked
+        except ValueError as e:
+            print("multicall reverted, fall back to slow method")
+            period_stakers = [
+                staker
+                for staker in stakers
+                if staker_info[staker][1] <= period and staker_info[staker][2] >= period
+            ]
+            for staker in tqdm(period_stakers):
+                spank_staked, *_ = spankbank.stakers(staker, block_identifier=end_block)
+                if spank_staked > 0:
+                    periods[period]["stakers"][staker] = spank_staked
 
     return dict(periods)
 
