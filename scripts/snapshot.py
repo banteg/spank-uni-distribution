@@ -1,29 +1,33 @@
 import json
 import os
 import pickle
-from collections import defaultdict
+from collections import Counter, defaultdict
 from functools import wraps
 from pathlib import Path
 
 import toml
-from brownie import interface, web3, chain
+from brownie import chain, interface, web3
 from eth_utils import event_abi_to_log_topic
 from hexbytes import HexBytes
-from toolz import groupby
-from tqdm import trange, tqdm
+from toolz import groupby, valfilter
+from tqdm import tqdm, trange
 
 spankbank_deploy = 6276045  # https://etherscan.io/tx/0xc6123eea98af9db149313005d9799eefd323baf1566adfaa53d25cc376229543
 uniswap_v1_deploy = 6627917  # https://etherscan.io/tx/0xc1b2646d0ad4a3a151ebdaaa7ef72e3ab1aa13aa49d0b7a3ca020f5ee7b1b010
 uni_deploy = 10861674  # https://etherscan.io/tx/0x4b37d2f343608457ca3322accdab2811c707acf3eb07a40dd8d9567093ea5b82
+spank_deploy = 4590304  # https://etherscan.io/tx/0x249effe35529e648be34903167e9cfaac757d9f12cc21c8a91da207519ab693e
 spankbank = interface.SpankBank("0x1ECB60873E495dDFa2a13A8F4140e490dd574E6F")
 multicall = interface.Multicall("0xeefBa1e63905eF1D7ACbA5a8513c70307C1cE441")
+spank = interface.HumanStandardToken("0x42d6622deCe394b54999Fbd73D108123806f6a18")
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 
 def main():
     logs = fetch_logs()
     events = decode_logs(logs)
-    calc_points(events)
-    calc_spank(events)
+    calc_spankbank_points(events)
+    calc_spankbank_spank(events)
+    calc_spank()
 
 
 def cached(path):
@@ -96,7 +100,7 @@ def decode_logs(logs):
 
 
 @cached("snapshot/03-spankpoints.json")
-def calc_points(events):
+def calc_spankbank_points(events):
     """
     Get active points for each staker for each period from CheckInEvent.
     """
@@ -109,12 +113,12 @@ def calc_points(events):
     return dict(periods)
 
 
-@cached("snapshot/04-spank.json")
-def calc_spank(events):
+@cached("snapshot/04-spankbank.json")
+def calc_spankbank_spank(events):
     """
     Get all stakers from [StakeEvent, SplitStakeEvent].
     For each period determine the block closest to period end time.
-    Get spank staked for each staker at end block of each period.
+    Get SPANK staked for each staker at end block of each period.
     """
     periods = {}
     events = groupby("event", events)
@@ -173,6 +177,37 @@ def calc_spank(events):
                     periods[period]["stakers"][staker] = spank_staked
 
     return dict(periods)
+
+
+@cached("snapshot/05-spank.json")
+def calc_spank():
+    """
+    Snapshot SPANK balances at UNI deploy block.
+    """
+    balances = transfers_to_balances(spank, spank_deploy, uni_deploy)
+    # FIX: initial balance misses an event assigning it
+    spank_deployer = "0xA7f00de671ebEB1b04C19a00842ff1d980847f0B"
+    balances[spank_deployer] += 10 ** 27
+    # NOTE: sanity check
+    for addr in [spank_deployer, str(spankbank)]:
+        assert balances[addr] == spank.balanceOf(addr, block_identifier=uni_deploy)
+    return balances
+
+
+def transfers_to_balances(contract, deploy_block, snapshot_block):
+    balances = Counter()
+    contract = web3.eth.contract(str(contract), abi=contract.abi)
+    step = 10000
+    for start in trange(deploy_block, snapshot_block, step):
+        end = min(start + step - 1, snapshot_block)
+        logs = contract.events.Transfer().getLogs(fromBlock=start, toBlock=end)
+        for log in logs:
+            if log["args"]["_from"] != ZERO_ADDRESS:
+                balances[log["args"]["_from"]] -= log["args"]["_value"]
+            if log["args"]["_to"] != ZERO_ADDRESS:
+                balances[log["args"]["_to"]] += log["args"]["_value"]
+
+    return valfilter(bool, dict(balances.most_common()))
 
 
 def timestamp_to_block_number(ts):
