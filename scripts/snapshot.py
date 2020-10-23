@@ -2,11 +2,13 @@ import json
 import os
 import pickle
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from pathlib import Path
 
 import toml
 from brownie import chain, interface, web3
+from brownie.exceptions import ContractNotFound
 from eth_utils import event_abi_to_log_topic
 from hexbytes import HexBytes
 from toolz import groupby, valfilter
@@ -18,16 +20,18 @@ uni_deploy = 10861674  # https://etherscan.io/tx/0x4b37d2f343608457ca3322accdab2
 spank_deploy = 4590304  # https://etherscan.io/tx/0x249effe35529e648be34903167e9cfaac757d9f12cc21c8a91da207519ab693e
 spankbank = interface.SpankBank("0x1ECB60873E495dDFa2a13A8F4140e490dd574E6F")
 multicall = interface.Multicall("0xeefBa1e63905eF1D7ACbA5a8513c70307C1cE441")
-spank = interface.HumanStandardToken("0x42d6622deCe394b54999Fbd73D108123806f6a18")
+spank = interface.ERC20("0x42d6622deCe394b54999Fbd73D108123806f6a18")
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+UNISWAP_FACTORY = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
 
 
 def main():
     logs = fetch_logs()
     events = decode_logs(logs)
-    calc_spankbank_points(events)
-    calc_spankbank_spank(events)
-    calc_spank()
+    points = calc_spankbank_points(events)
+    staked_balances = calc_spankbank_spank(events)
+    snapshot_balances = calc_spank()
+    find_contracts(snapshot_balances)
 
 
 def cached(path):
@@ -194,6 +198,19 @@ def calc_spank():
     return balances
 
 
+@cached("snapshot/06-contracts.json")
+def find_contracts(balances):
+    pool = ThreadPoolExecutor(10)
+    codes = pool.map(web3.eth.getCode, balances)
+    contracts = {
+        user: balances[user]
+        for user, code in tqdm(zip(balances, codes), total=len(balances))
+        if code
+    }
+    print(f"{len(contracts)} contracts found")
+    return contracts
+
+
 def transfers_to_balances(contract, deploy_block, snapshot_block):
     balances = Counter()
     contract = web3.eth.contract(str(contract), abi=contract.abi)
@@ -202,10 +219,10 @@ def transfers_to_balances(contract, deploy_block, snapshot_block):
         end = min(start + step - 1, snapshot_block)
         logs = contract.events.Transfer().getLogs(fromBlock=start, toBlock=end)
         for log in logs:
-            if log["args"]["_from"] != ZERO_ADDRESS:
-                balances[log["args"]["_from"]] -= log["args"]["_value"]
-            if log["args"]["_to"] != ZERO_ADDRESS:
-                balances[log["args"]["_to"]] += log["args"]["_value"]
+            if log["args"]["src"] != ZERO_ADDRESS:
+                balances[log["args"]["src"]] -= log["args"]["wad"]
+            if log["args"]["dst"] != ZERO_ADDRESS:
+                balances[log["args"]["dst"]] += log["args"]["wad"]
 
     return valfilter(bool, dict(balances.most_common()))
 
@@ -221,3 +238,13 @@ def timestamp_to_block_number(ts):
         else:
             hi = mid
     return hi
+
+
+def is_uniswap(address):
+    try:
+        pair = interface.UniswapPair(address)
+        assert pair.factory() == UNISWAP_FACTORY
+        print(f"{address} is a uniswap pool")
+    except (AssertionError, ValueError):
+        return False
+    return True
