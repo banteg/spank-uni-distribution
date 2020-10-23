@@ -8,6 +8,8 @@ import "./interfaces/IMerkleDistributor.sol";
 contract MerkleDistributor is IMerkleDistributor {
     address public immutable override token;
     bytes32 public immutable override merkleRoot;
+    address public owner;
+    uint public unlock;
 
     // This is a packed array of booleans.
     mapping(uint256 => uint256) private claimedBitMap;
@@ -15,6 +17,8 @@ contract MerkleDistributor is IMerkleDistributor {
     constructor(address token_, bytes32 merkleRoot_) public {
         token = token_;
         merkleRoot = merkleRoot_;
+        owner = msg.sender;
+        unlock = block.timestamp + 180 days;
     }
 
     function isClaimed(uint256 index) public view override returns (bool) {
@@ -43,5 +47,11 @@ contract MerkleDistributor is IMerkleDistributor {
         require(IERC20(token).transfer(account, amount), 'MerkleDistributor: Transfer failed.');
 
         emit Claimed(index, account, amount);
+    }
+
+    function fold() public {
+        require(block.timestamp >= unlock, 'MerkleDistributor: Claim period has not passed.');
+        uint amount = IERC20(token).balanceOf(address(this));
+        require(IERC20(token).transfer(owner, amount));
     }
 }
