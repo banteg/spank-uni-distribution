@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from pathlib import Path
+from fractions import Fraction
 
 import toml
 from brownie import chain, interface, web3
@@ -18,6 +19,7 @@ spankbank_deploy = 6276045  # https://etherscan.io/tx/0xc6123eea98af9db149313005
 uniswap_v1_deploy = 6627917  # https://etherscan.io/tx/0xc1b2646d0ad4a3a151ebdaaa7ef72e3ab1aa13aa49d0b7a3ca020f5ee7b1b010
 uni_deploy = 10861674  # https://etherscan.io/tx/0x4b37d2f343608457ca3322accdab2811c707acf3eb07a40dd8d9567093ea5b82
 spank_deploy = 4590304  # https://etherscan.io/tx/0x249effe35529e648be34903167e9cfaac757d9f12cc21c8a91da207519ab693e
+uniswap_v2_deploy = 10000835  # https://etherscan.io/tx/0xc31d7e7e85cab1d38ce1b8ac17e821ccd47dbde00f9d57f2bd8613bff9428396
 spankbank = interface.SpankBank("0x1ECB60873E495dDFa2a13A8F4140e490dd574E6F")
 multicall = interface.Multicall("0xeefBa1e63905eF1D7ACbA5a8513c70307C1cE441")
 spank = interface.ERC20("0x42d6622deCe394b54999Fbd73D108123806f6a18")
@@ -31,7 +33,8 @@ def main():
     points = calc_spankbank_points(events)
     staked_balances = calc_spankbank_spank(events)
     snapshot_balances = calc_spank()
-    find_contracts(snapshot_balances)
+    contract_balances = find_contracts(snapshot_balances)
+    calc_uniswap(contract_balances)
 
 
 def cached(path):
@@ -209,6 +212,33 @@ def find_contracts(balances):
     }
     print(f"{len(contracts)} contracts found")
     return contracts
+
+
+@cached("snapshot/07-uniswap.json")
+def calc_uniswap(contracts):
+    replacements = {}
+    for address in contracts:
+        if not is_uniswap(address):
+            continue
+
+        # no need to check the pool contents since we already know the equivalent value
+        # so we just grab the lp share distribution and distirbute the tokens pro-rata
+
+        balances = transfers_to_balances(
+            interface.ERC20(address), uniswap_v2_deploy, uni_deploy
+        )
+        supply = sum(balances.values())
+        if not supply:
+            continue
+        replacements[address] = {
+            user: int(Fraction(balances[user], supply) * contracts[address])
+            for user in balances
+        }
+        assert (
+            sum(replacements[address].values()) <= contracts[address]
+        ), "no inflation ser"
+
+    return replacements
 
 
 def transfers_to_balances(contract, deploy_block, snapshot_block):
