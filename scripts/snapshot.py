@@ -103,7 +103,7 @@ def calc_points(events):
     periods = defaultdict(dict)
     events = groupby("event", events)
     for event in events["CheckInEvent"]:
-        if event.blockNumber < uniswap_v1_deploy or event.blockNumber > uni_deploy:
+        if event.blockNumber > uni_deploy:
             continue
         periods[event.args.period][event.args.staker] = event.args.spankPoints
     return dict(periods)
