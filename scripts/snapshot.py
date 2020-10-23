@@ -97,6 +97,9 @@ def decode_logs(logs):
 
 @cached("snapshot/03-spankpoints.json")
 def calc_points(events):
+    """
+    Get active points for each staker for each period from CheckInEvent.
+    """
     periods = defaultdict(dict)
     events = groupby("event", events)
     for event in events["CheckInEvent"]:
@@ -108,13 +111,18 @@ def calc_points(events):
 
 @cached("snapshot/04-spank.json")
 def calc_spank(events):
+    """
+    Get all stakers from [StakeEvent, SplitStakeEvent].
+    For each period determine the block closest to period end time.
+    Get spank staked for each staker at end block of each period.
+    """
     periods = {}
     events = groupby("event", events)
     new_stakers = {event.args.staker for event in events["StakeEvent"]}
     split_stakers = {event.args.newAddress for event in events["SplitStakeEvent"]}
     stakers = sorted(new_stakers | split_stakers)
     print(len(stakers), "stakers")
-    end_time = chain[uni_deploy].timestamp
+    snapshot_end_time = chain[uni_deploy].timestamp
     calls = [
         [str(spankbank), spankbank.stakers.encode_input(staker)] for staker in stakers
     ]
@@ -123,21 +131,29 @@ def calc_spank(events):
         staker: spankbank.stakers.decode_output(resp)
         for staker, resp in zip(stakers, results)
     }
-
-    for period in range(1, spankbank.currentPeriod() + 1):
-        data = spankbank.periods(period)
-        period_end = data[5]
-        if period_end > end_time:
+    periods_end_times = {
+        period: spankbank.periods(period)[5]
+        for period in range(1, spankbank.currentPeriod() + 1)
+    }
+    periods_info = {
+        period: {"end_time": end_time, "end_block": timestamp_to_block_number(end_time)}
+        for period, end_time in periods_end_times.items()
+        if end_time <= snapshot_end_time
+    }
+    print(periods_info)
+    for period, info in periods_info.items():
+        if info["end_time"] > snapshot_end_time:
             break
-        end_block = timestamp_to_block_number(period_end)
         periods[period] = {
-            "snapshot_block": end_block,
-            "period_end": period_end,
+            "end_block": info["end_block"],
+            "end_time": info["end_time"],
             "stakers": {},
         }
-        print(f"period {period} snapshot block {end_block}")
+        print(f"period {period} snapshot block {info['end_block']}")
         try:
-            _, results = multicall.aggregate.call(calls, block_identifier=end_block)
+            _, results = multicall.aggregate.call(
+                calls, block_identifier=info["end_block"]
+            )
             for staker, resp in zip(stakers, results):
                 spank_staked, *_ = spankbank.stakers.decode_output(resp)
                 if spank_staked > 0:
@@ -150,7 +166,9 @@ def calc_spank(events):
                 if staker_info[staker][1] <= period and staker_info[staker][2] >= period
             ]
             for staker in tqdm(period_stakers):
-                spank_staked, *_ = spankbank.stakers(staker, block_identifier=end_block)
+                spank_staked, *_ = spankbank.stakers(
+                    staker, block_identifier=info["end_block"]
+                )
                 if spank_staked > 0:
                     periods[period]["stakers"][staker] = spank_staked
 
@@ -159,7 +177,7 @@ def calc_spank(events):
 
 def timestamp_to_block_number(ts):
     lo = 0
-    hi = chain.height
+    hi = chain.height - 30  # fix for "block not found"
     threshold = 1
     while abs(hi - lo) > threshold:
         mid = (hi - lo) // 2 + lo
@@ -168,8 +186,3 @@ def timestamp_to_block_number(ts):
         else:
             hi = mid
     return hi
-
-
-def to_camel_case(snake_str):
-    components = snake_str.split("_")
-    return components[0] + "".join(x.title() for x in components[1:])
