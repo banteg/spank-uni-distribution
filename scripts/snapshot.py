@@ -9,13 +9,15 @@ from itertools import zip_longest
 from pathlib import Path
 
 import toml
-from brownie import Wei, chain, interface, web3
+from brownie import MerkleDistributor, Wei, accounts, chain, interface, web3
+from click import secho
 from eth_abi.packed import encode_abi_packed
 from eth_utils import encode_hex, event_abi_to_log_topic
 from hexbytes import HexBytes
 from toolz import groupby, valfilter
 from tqdm import tqdm, trange
 
+DISTRIBUTOR_ADDRESS = ...
 DISTRIBUTION_TOTAL = Wei("695060.118 ether")
 POINTS_TOTAL = Wei("111209.61888 ether")
 STAKED_TOTAL = Wei("444838.47552 ether")
@@ -348,6 +350,33 @@ def prepare_merkle_tree(balances):
     }
     print(f"merkle root: {encode_hex(tree.root)}")
     return distribution
+
+
+def deploy():
+    user = accounts.load(input("account: "))
+    tree = json.load(open("snapshot/10-merkle-distribution.json"))
+    root = tree["merkleRoot"]
+    token = str(spank)
+    MerkleDistributor.deploy(token, root, {"from": user})
+
+
+def claim():
+    claimer = accounts.load(input("account: "))
+    dist = MerkleDistributor.at(DISTRIBUTOR_ADDRESS)
+    tree = json.load(open("snapshot/10-merkle-distribution.json"))
+    claim_other = input("Claim for another account? y/n [default: n] ") or "n"
+    assert claim_other in {"y", "n"}
+    user = str(claimer) if claim_other == "n" else input("Enter address to claim for: ")
+
+    if user not in tree["claims"]:
+        return secho(f"{user} is not included in the distribution", fg="red")
+    claim = tree["claims"][user]
+    if dist.isClaimed(claim["index"]):
+        return secho(f"{user} has already claimed", fg="yellow")
+
+    amount = Wei(int(claim["amount"], 16)).to("ether")
+    secho(f"Claimable amount: {amount} UNI", fg="green")
+    dist.claim(claim["index"], user, claim["amount"], claim["proof"], {"from": claimer})
 
 
 def transfers_to_balances(contract, deploy_block, snapshot_block):
