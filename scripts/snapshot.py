@@ -5,11 +5,13 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 from functools import wraps
+from itertools import zip_longest
 from pathlib import Path
 
 import toml
 from brownie import Wei, chain, interface, web3
-from eth_utils import event_abi_to_log_topic
+from eth_abi.packed import encode_abi_packed
+from eth_utils import encode_hex, event_abi_to_log_topic
 from hexbytes import HexBytes
 from toolz import groupby, valfilter
 from tqdm import tqdm, trange
@@ -52,7 +54,8 @@ def main():
     contract_balances = find_contracts(snapshot_balances)
     uni_lps = calc_uniswap(contract_balances)
     snapshot_balances = unwrap_balances(snapshot_balances, uni_lps)
-    prepare_distribution(points, staked_balances, snapshot_balances)
+    distribution = prepare_distribution(points, staked_balances, snapshot_balances)
+    tree = prepare_merkle_tree(distribution)
 
 
 def cached(path):
@@ -320,6 +323,33 @@ def prepare_distribution(points, staked_balances, snapshot_balances):
     return dict(Counter(distribution).most_common())
 
 
+@cached("snapshot/10-merkle-distribution.json")
+def prepare_merkle_tree(balances):
+    elements = [
+        (index, account, amount)
+        for index, (account, amount) in enumerate(balances.items())
+    ]
+    nodes = [
+        encode_hex(encode_abi_packed(["uint", "address", "uint"], el))
+        for el in elements
+    ]
+    tree = MerkleTree(nodes)
+    distribution = {
+        "merkleRoot": encode_hex(tree.root),
+        "tokenTotal": hex(sum(balances.values())),
+        "claims": {
+            user: {
+                "index": index,
+                "amount": hex(amount),
+                "proof": tree.get_proof(nodes[index]),
+            }
+            for index, user, amount in elements
+        },
+    }
+    print(f"merkle root: {encode_hex(tree.root)}")
+    return distribution
+
+
 def transfers_to_balances(contract, deploy_block, snapshot_block):
     balances = Counter()
     contract = web3.eth.contract(str(contract), abi=contract.abi)
@@ -357,3 +387,46 @@ def is_uniswap(address):
     except (AssertionError, ValueError):
         return False
     return True
+
+
+class MerkleTree:
+    def __init__(self, elements):
+        self.elements = sorted(set(web3.keccak(hexstr=el) for el in elements))
+        self.layers = MerkleTree.get_layers(self.elements)
+
+    @property
+    def root(self):
+        return self.layers[-1][0]
+
+    def get_proof(self, el):
+        el = web3.keccak(hexstr=el)
+        idx = self.elements.index(el)
+        proof = []
+        for layer in self.layers:
+            pair_idx = idx + 1 if idx % 2 == 0 else idx - 1
+            if pair_idx < len(layer):
+                proof.append(encode_hex(layer[pair_idx]))
+            idx //= 2
+        return proof
+
+    @staticmethod
+    def get_layers(elements):
+        layers = [elements]
+        while len(layers[-1]) > 1:
+            layers.append(MerkleTree.get_next_layer(layers[-1]))
+        return layers
+
+    @staticmethod
+    def get_next_layer(elements):
+        return [
+            MerkleTree.combined_hash(a, b)
+            for a, b in zip_longest(elements[::2], elements[1::2])
+        ]
+
+    @staticmethod
+    def combined_hash(a, b):
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return web3.keccak(b"".join(sorted([a, b])))
