@@ -34,7 +34,8 @@ def main():
     staked_balances = calc_spankbank_spank(events)
     snapshot_balances = calc_spank()
     contract_balances = find_contracts(snapshot_balances)
-    calc_uniswap(contract_balances)
+    uni_lps = calc_uniswap(contract_balances)
+    snapshot_balances = unwrap_balances(snapshot_balances, uni_lps)
 
 
 def cached(path):
@@ -239,6 +240,16 @@ def calc_uniswap(contracts):
         ), "no inflation ser"
 
     return replacements
+
+
+@cached("snapshot/08-unwrapped.json")
+def unwrap_balances(balances, replacements):
+    for remove, additions in replacements.items():
+        balances.pop(remove)
+        for user, balance in additions.items():
+            balances.setdefault(user, 0)
+            balances[user] += balance
+    return dict(Counter(balances).most_common())
 
 
 def transfers_to_balances(contract, deploy_block, snapshot_block):
