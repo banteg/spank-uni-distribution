@@ -3,17 +3,34 @@ import os
 import pickle
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from fractions import Fraction
 from functools import wraps
 from pathlib import Path
-from fractions import Fraction
 
 import toml
-from brownie import chain, interface, web3
-from brownie.exceptions import ContractNotFound
+from brownie import Wei, chain, interface, web3
 from eth_utils import event_abi_to_log_topic
 from hexbytes import HexBytes
 from toolz import groupby, valfilter
 from tqdm import tqdm, trange
+
+DISTRIBUTION_TOTAL = Wei("695060.118 ether")
+POINTS_TOTAL = Wei("111209.61888 ether")
+STAKED_TOTAL = Wei("444838.47552 ether")
+SNAPSHOT_TOTAL = Wei("139012.0236 ether")
+DUST = Wei("6.69 ether")  # 20 usd
+EXCLUDED = {
+    "0xDc9727D102f00adF0043d04431b6cd162c5114ea": "multisig",
+    "0x1ECB60873E495dDFa2a13A8F4140e490dd574E6F": "spankbank",
+    "0x742d35Cc6634C0532925a3b844Bc454e4438f44e": "bitfinex",
+    "0x876EabF441B2EE5B5b0554Fd502a8E0600950cFa": "bitfinex",
+    "0xF1A5D5F652f391a906d7347F001099280D7abbF5": "vesting skip",
+    "0x2a0c0DBEcC7E4D658f48E01e3fA353F44050c208": "idex",
+    "0x8d12A197cB00D4747a1fe03395095ce2A5CC6819": "etherdelta",
+    "0xfb54e05f36095f07f281722b805d65329db8700f": "vesting skip",
+    "0x6a99e0d5065ed09433ba99faf0944faa57c1ab26": "vesting skip",
+    "0x9426614d930adc9fe4c15f86b7bdd3e9b095961b": "vesting skip",
+}
 
 spankbank_deploy = 6276045  # https://etherscan.io/tx/0xc6123eea98af9db149313005d9799eefd323baf1566adfaa53d25cc376229543
 uniswap_v1_deploy = 6627917  # https://etherscan.io/tx/0xc1b2646d0ad4a3a151ebdaaa7ef72e3ab1aa13aa49d0b7a3ca020f5ee7b1b010
@@ -36,6 +53,7 @@ def main():
     contract_balances = find_contracts(snapshot_balances)
     uni_lps = calc_uniswap(contract_balances)
     snapshot_balances = unwrap_balances(snapshot_balances, uni_lps)
+    prepare_distribution(points, staked_balances, snapshot_balances)
 
 
 def cached(path):
@@ -250,6 +268,57 @@ def unwrap_balances(balances, replacements):
             balances.setdefault(user, 0)
             balances[user] += balance
     return dict(Counter(balances).most_common())
+
+
+@cached("snapshot/09-distribution.json")
+def prepare_distribution(points, staked_balances, snapshot_balances):
+    assert POINTS_TOTAL + STAKED_TOTAL + SNAPSHOT_TOTAL == DISTRIBUTION_TOTAL
+
+    distribution = Counter()
+
+    points_amounts = Counter()
+    for period in points:
+        for user, amount in points[period].items():
+            if user in EXCLUDED:
+                continue
+            points_amounts[user] += amount
+    ratio = Fraction(POINTS_TOTAL, sum(points_amounts.values()))
+    for user, amount in points_amounts.items():
+        distribution[user] += int(amount * ratio)
+
+    staked_amounts = Counter()
+    for period in staked_balances:
+        for user, amount in staked_balances[period]["stakers"].items():
+            if user in EXCLUDED:
+                continue
+            staked_amounts[user] += amount
+    ratio = Fraction(STAKED_TOTAL, sum(staked_amounts.values()))
+    for user, amount in staked_amounts.items():
+        distribution[user] += int(amount * ratio)
+
+    snapshot_amounts = Counter()
+    for user, amount in snapshot_balances.items():
+        if user in EXCLUDED:
+            continue
+        snapshot_amounts[user] += amount
+    ratio = Fraction(SNAPSHOT_TOTAL, sum(snapshot_amounts.values()))
+    for user, amount in snapshot_amounts.items():
+        distribution[user] += int(amount * ratio)
+
+    distribution = {
+        user: amount for user, amount in distribution.items() if amount >= DUST
+    }
+
+    distribution_total = sum(distribution.values())
+    ratio = Fraction(DISTRIBUTION_TOTAL, distribution_total)
+    distribution = {user: int(amount * ratio) for user, amount in distribution.items()}
+    assert sum(distribution.values()) <= DISTRIBUTION_TOTAL, "no inflation ser"
+
+    print("target:", DISTRIBUTION_TOTAL.to("ether"))
+    print("actual:", Wei(sum(distribution.values())).to("ether"))
+    print("recipients:", len(distribution))
+
+    return dict(Counter(distribution).most_common())
 
 
 def transfers_to_balances(contract, deploy_block, snapshot_block):
