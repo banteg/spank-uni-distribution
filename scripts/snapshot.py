@@ -37,27 +37,27 @@ EXCLUDED = {
 
 spankbank_deploy = 6276045  # https://etherscan.io/tx/0xc6123eea98af9db149313005d9799eefd323baf1566adfaa53d25cc376229543
 uniswap_v1_deploy = 6627917  # https://etherscan.io/tx/0xc1b2646d0ad4a3a151ebdaaa7ef72e3ab1aa13aa49d0b7a3ca020f5ee7b1b010
-uni_deploy = 10861674  # https://etherscan.io/tx/0x4b37d2f343608457ca3322accdab2811c707acf3eb07a40dd8d9567093ea5b82
+uni_deploy = 11927314  # https://etherscan.io/tx/0x4b37d2f343608457ca3322accdab2811c707acf3eb07a40dd8d9567093ea5b82
 spank_deploy = 4590304  # https://etherscan.io/tx/0x249effe35529e648be34903167e9cfaac757d9f12cc21c8a91da207519ab693e
 uniswap_v2_deploy = 10000835  # https://etherscan.io/tx/0xc31d7e7e85cab1d38ce1b8ac17e821ccd47dbde00f9d57f2bd8613bff9428396
+expired_by_timestamp = 1609477200 # January First 2021
 spankbank = interface.SpankBank("0x1ECB60873E495dDFa2a13A8F4140e490dd574E6F")
 multicall = interface.Multicall("0xeefBa1e63905eF1D7ACbA5a8513c70307C1cE441")
 spank = interface.ERC20("0x42d6622deCe394b54999Fbd73D108123806f6a18")
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 UNISWAP_FACTORY = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
-
+LAST_PERIOD_TO_QUALIFY = 28
 
 def main():
     logs = fetch_logs()
     events = decode_logs(logs)
+    qualified_stakers = get_qualified_stakers(events)
+    calculate_points(events, qualified_stakers)
     points = calc_spankbank_points(events)
+    # calculate_max_spank_for_qualified_stakers(qualified_stakers, points)
     staked_balances = calc_spankbank_spank(events)
-    snapshot_balances = calc_spank()
-    contract_balances = find_contracts(snapshot_balances)
-    uni_lps = calc_uniswap(contract_balances)
-    snapshot_balances = unwrap_balances(snapshot_balances, uni_lps)
-    distribution = prepare_distribution(points, staked_balances, snapshot_balances)
-    tree = prepare_merkle_tree(distribution)
+    # distribution = prepare_distribution(points, staked_balances)
+    # tree = prepare_merkle_tree(distribution)
 
 
 def cached(path):
@@ -139,9 +139,9 @@ def calc_spankbank_points(events):
     for event in events["CheckInEvent"]:
         if event.blockNumber > uni_deploy:
             continue
+        print(event)
         periods[event.args.period][event.args.staker] = event.args.spankPoints
     return dict(periods)
-
 
 @cached("snapshot/04-spankbank.json")
 def calc_spankbank_spank(events):
@@ -166,13 +166,15 @@ def calc_spankbank_spank(events):
         for staker, resp in zip(stakers, results)
     }
     periods_end_times = {
-        period: spankbank.periods(period)[5]
+        period: spankbank.periods(period)
         for period in range(1, spankbank.currentPeriod() + 1)
     }
+
+    print(periods_end_times)
     periods_info = {
-        period: {"end_time": end_time, "end_block": timestamp_to_block_number(end_time)}
-        for period, end_time in periods_end_times.items()
-        if end_time <= snapshot_end_time
+        period: {"end_time": period_struct[5], "end_block": timestamp_to_block_number(period_struct[5]), "startTime": period_struct[4], "startBlock": timestamp_to_block_number(period_struct[4])}
+        for period, period_struct in periods_end_times.items()
+        if period_struct[5] <= snapshot_end_time
     }
     print(periods_info)
     for period, info in periods_info.items():
@@ -208,6 +210,85 @@ def calc_spankbank_spank(events):
 
     return dict(periods)
 
+
+def get_qualified_stakers(events):
+    """
+    Get all staker addresses whose stakes from stakeEvent and splitStakeEvent didnt expire by Jan 1st 2021
+    """
+    qualifiedStakers = set()
+    events = groupby("event", events)
+    new_stakers = {event.args.staker for event in events["StakeEvent"]}
+    split_stakers = {event.args.newAddress for event in events["SplitStakeEvent"]}
+    checkin_stakers = {event.args.staker for event in events["CheckInEvent"]}
+
+    stakers = sorted(new_stakers | split_stakers | checkin_stakers)
+    print(len(stakers), "stakers")
+    calls = [
+        [str(spankbank), spankbank.stakers.encode_input(staker)] for staker in stakers
+    ]
+    _, results = multicall.aggregate.call(calls)
+    staker_info = {
+        staker: spankbank.stakers.decode_output(resp)
+        for staker, resp in zip(stakers, results)
+    }
+    for staker in staker_info:
+        if staker_info[staker][2] >= LAST_PERIOD_TO_QUALIFY:
+            qualifiedStakers.add(staker)
+    print(len(qualifiedStakers))
+    return {"stakers": qualifiedStakers,
+            "stakerInfo": staker_info}
+
+@cached("snapshot/points.json")
+def calculate_points(events, qualified_stakers):
+    """
+    Get 3 different types of spankpoints for each staker - (spankpoints, period)
+    - First stake event
+    - latest checkin
+    - highest ever
+    """
+    events = groupby("event", events)
+    first_staking_period_points = defaultdict(dict)
+    post_checkin_points = defaultdict(dict)
+    max_ever_spankpoints = defaultdict(dict)
+
+    for event in events["StakeEvent"]:
+        if event.args.staker in qualified_stakers["stakers"]:
+            if event.args.staker in first_staking_period_points:
+                """
+                See if its an earlier period for staking
+                """
+                if event.args.period < first_staking_period_points[event.args.staker][1]:
+                    first_staking_period_points[event.args.staker] = (event.args.spankPoints, event.args.period)
+            else:
+                first_staking_period_points[event.args.staker] = (event.args.spankPoints, event.args.period)
+
+            if event.args.staker not in max_ever_spankpoints or event.args.spankPoints > max_ever_spankpoints[event.args.staker][0]:
+                 max_ever_spankpoints[event.args.staker] = (event.args.spankPoints, event.args.period)
+
+    for event in events["CheckInEvent"]:
+        if event.args.staker in qualified_stakers["stakers"]:
+            if event.args.staker in post_checkin_points:
+                """
+                See if its a later period for checkin
+                """
+                if event.args.period > post_checkin_points[event.args.staker][1]:
+                    post_checkin_points[event.args.staker] = (event.args.spankPoints, event.args.period)
+            else:
+                post_checkin_points[event.args.staker] = (event.args.spankPoints, event.args.period)
+
+            if event.args.staker not in max_ever_spankpoints or event.args.spankPoints > max_ever_spankpoints[event.args.staker][0]:
+                 max_ever_spankpoints[event.args.staker] = (event.args.spankPoints, event.args.period)
+    print(post_checkin_points)
+    return dict({"points": {
+        "first staking period points": first_staking_period_points,
+        "post checkin period points": post_checkin_points,
+        "max ever points": max_ever_spankpoints
+    }})
+
+
+# @cached("snapshot/result.json")
+# def calculate_max_spank_for_qualified_stakers(qualified_stakers, points):
+#     for staker in qualified_stakers["stakers"]:
 
 @cached("snapshot/05-spank.json")
 def calc_spank():
@@ -275,7 +356,7 @@ def unwrap_balances(balances, replacements):
 
 
 @cached("snapshot/09-distribution.json")
-def prepare_distribution(points, staked_balances, snapshot_balances):
+def prepare_distribution(points, staked_balances):
     assert POINTS_TOTAL + STAKED_TOTAL + SNAPSHOT_TOTAL == DISTRIBUTION_TOTAL
 
     distribution = Counter()
@@ -298,15 +379,6 @@ def prepare_distribution(points, staked_balances, snapshot_balances):
             staked_amounts[user] += amount
     ratio = Fraction(STAKED_TOTAL, sum(staked_amounts.values()))
     for user, amount in staked_amounts.items():
-        distribution[user] += int(amount * ratio)
-
-    snapshot_amounts = Counter()
-    for user, amount in snapshot_balances.items():
-        if user in EXCLUDED:
-            continue
-        snapshot_amounts[user] += amount
-    ratio = Fraction(SNAPSHOT_TOTAL, sum(snapshot_amounts.values()))
-    for user, amount in snapshot_amounts.items():
         distribution[user] += int(amount * ratio)
 
     distribution = {
